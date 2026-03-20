@@ -1,212 +1,156 @@
 import os
 import sqlite3
-import random
-import hashlib
 import secrets
-import logging
+import re
 import google.generativeai as genai
-from datetime import datetime
-from flask import Flask, request, jsonify, render_template, g
+from flask import Flask, request, jsonify, render_template_string, g
 from flask_cors import CORS
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
 from deep_translator import GoogleTranslator
+from werkzeug.security import generate_password_hash, check_password_hash
 
-# -----------------------
-# CONFIGURATION & SECURITY
-# -----------------------
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") # Get from aistudio.google.com
-SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_hex(32))
-DB_FILE = "randyx_ai.db"
-
-if not GEMINI_API_KEY:
-    print("⚠️ WARNING: GEMINI_API_KEY not set. AI will use fallback mode.")
-else:
-    genai.configure(api_key=GEMINI_API_KEY)
+# --- 1. CONFIGURATION ---
+# Replace with your actual key or set it in your Environment Variables
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_API_KEY_HERE")
+genai.configure(api_key=GEMINI_API_KEY)
 
 app = Flask(__name__)
-app.secret_key = SECRET_KEY
+app.secret_key = secrets.token_hex(64)
 CORS(app)
-limiter = Limiter(app=app, key_func=get_remote_address)
 
-# -----------------------
-# DATABASE & AI LOGIC
-# -----------------------
+DB_FILE = "randyx_pro_final.db"
+
+# --- 2. DATABASE LOGIC ---
+def get_db():
+    db = getattr(g, '_database', None)
+    if db is None:
+        db = g._database = sqlite3.connect(DB_FILE)
+        db.row_factory = sqlite3.Row
+    return db
+
+@app.teardown_appcontext
+def close_connection(exception):
+    db = getattr(g, '_database', None)
+    if db is not None:
+        db.close()
+
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, language TEXT, premium INTEGER)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, user_id INTEGER, message TEXT, response TEXT, timestamp DATETIME)''')
-    conn.commit()
-    conn.close()
+    with app.app_context():
+        db = get_db()
+        db.execute('''CREATE TABLE IF NOT EXISTS users 
+                     (id INTEGER PRIMARY KEY, name TEXT UNIQUE, password TEXT, 
+                      hint TEXT, language TEXT DEFAULT 'en')''')
+        db.commit()
 
 init_db()
 
-def get_ai_response(prompt, user_name, is_premium):
-    if not GEMINI_API_KEY:
-        return "I'm in offline mode. Please set my API Key to start chatting!"
-    
-    try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        # System instructions to give it personality
-        full_prompt = f"You are Randy-X AI, a helpful and witty assistant. The user's name is {user_name}. Provide a clear, helpful response to: {prompt}"
-        
-        response = model.generate_content(full_prompt)
-        text = response.text
-        
-        # Trial users only get the first 150 characters
-        if not is_premium:
-            if len(text) > 150:
-                text = text[:150] + "... [Upgrade to Premium for full answers!]"
-        return text
-    except Exception as e:
-        return f"Error connecting to brain: {str(e)}"
+# --- 3. MATH & AI ENGINES ---
+def safe_math(text):
+    clean = re.sub(r'[^0-9\+\-\*\/\%\.\(\)]', '', text)
+    if any(op in text for op in "+-*/%") and len(clean) > 1:
+        try:
+            return f"Result: {eval(clean, {'__builtins__': None}, {})}"
+        except: return None
+    return None
 
-# -----------------------
-# ROUTES
-# -----------------------
+def get_ai_response(prompt, user_name):
+    try:
+        model = genai.GenerativeModel('gemini-1.5-pro')
+        persona = f"You are Randy-X Pro, the elite AI assistant for {user_name}. Expertise: Python, Apps."
+        response = model.generate_content([persona, prompt])
+        return response.text
+    except:
+        return "Neural Link Offline. Check API Key."
+
+# --- 4. BACKEND ROUTES ---
 @app.route("/")
 def home():
-    return render_template("index.html")
+    return render_template_string(HTML_UI)
 
-@app.route("/register", methods=["POST"])
-def register():
+@app.route("/auth", methods=["POST"])
+def auth():
     data = request.json
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("INSERT INTO users (name, language, premium) VALUES (?, ?, ?)", 
-              (data['name'], data['language'], data.get('premium', 0)))
-    user_id = c.lastrowid
-    conn.commit()
-    conn.close()
-    return jsonify({"user_id": user_id, "name": data['name'], "premium": data.get('premium', 0)})
+    name, password, mode = data.get('name'), data.get('password'), data.get('mode')
+    db = get_db(); c = db.cursor()
+    user = c.execute("SELECT * FROM users WHERE name=?", (name,)).fetchone()
+
+    if mode == 'register':
+        if user: return jsonify({"error": "User Exists"}), 400
+        c.execute("INSERT INTO users (name, password, hint) VALUES (?, ?, ?)", 
+                  (name, generate_password_hash(password), data.get('hint')))
+        db.commit()
+        return jsonify({"success": True})
+    
+    if user and check_password_hash(user['password'], password):
+        return jsonify({"name": user['name']})
+    return jsonify({"error": "Failed"}), 401
 
 @app.route("/ask", methods=["POST"])
 def ask():
-    data = request.json
-    user_id = data.get("user_id")
+    msg = request.form.get("message", "")
+    user = request.form.get("username", "Admin")
     
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    user = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
-    
-    answer = get_ai_response(data['message'], user['name'] if user else "Guest", user['premium'] if user else 0)
-    
-    if user['language'] != 'en':
-        try:
-            answer = GoogleTranslator(source='auto', target=user['language']).translate(answer)
-        except: pass
+    # Check Math -> Then AI
+    res = safe_math(msg) or get_ai_response(msg, user)
+    return jsonify({"answer": res})
 
-    conn.execute("INSERT INTO messages (user_id, message, response, timestamp) VALUES (?, ?, ?, ?)",
-                 (user_id, data['message'], answer, datetime.now()))
-    conn.commit()
-    conn.close()
-    
-    return jsonify({"answer": answer})
-
-# -----------------------
-# UI DESIGN (THE BEAUTIFUL VERSION)
-# -----------------------
-HTML_TEMPLATE = """
+# --- 5. THE MOBILE-PRO UI (HTML/CSS/JS) ---
+HTML_UI = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Randy-X | Next Gen AI</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>Randy-X Pro</title>
     <style>
-        :root { --primary: #00d2ff; --secondary: #3a7bd5; }
-        body { 
-            margin: 0; 
-            font-family: 'Inter', sans-serif;
-            background: linear-gradient(rgba(0,0,0,0.6), rgba(0,0,0,0.6)), 
-                        url('https://images.unsplash.com/photo-1451187580459-43490279c0fa?ixlib=rb-1.2.1&auto=format&fit=crop&w=1920&q=80');
-            background-size: cover;
-            background-position: center;
-            background-attachment: fixed;
-            height: 100vh;
-            display: flex; justify-content: center; align-items: center;
-        }
-        .glass-card {
-            background: rgba(255, 255, 255, 0.1);
-            backdrop-filter: blur(15px);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            border-radius: 24px;
-            width: 90%; max-width: 900px; height: 80vh;
-            display: flex; flex-direction: column; overflow: hidden;
-            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.8);
-        }
-        header { padding: 20px; text-align: center; color: white; border-bottom: 1px solid rgba(255,255,255,0.1); }
-        #chat-box { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 15px; }
-        .msg { padding: 12px 18px; border-radius: 15px; max-width: 80%; color: white; line-height: 1.5; font-size: 15px; }
-        .user { align-self: flex-end; background: var(--secondary); border-bottom-right-radius: 2px; }
-        .ai { align-self: flex-start; background: rgba(255,255,255,0.15); border-bottom-left-radius: 2px; }
-        .input-area { padding: 20px; background: rgba(0,0,0,0.2); display: flex; gap: 10px; }
-        input { 
-            flex: 1; background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.3);
-            padding: 12px 20px; border-radius: 30px; color: white; outline: none;
-        }
-        button { 
-            background: linear-gradient(45deg, var(--primary), var(--secondary));
-            border: none; padding: 10px 25px; border-radius: 30px; color: white; font-weight: bold; cursor: pointer;
-            transition: 0.3s;
-        }
-        button:hover { transform: scale(1.05); }
-        #reg-form { position: absolute; inset: 0; background: rgba(0,0,0,0.85); display: flex; flex-direction: column; justify-content: center; align-items: center; z-index: 10; color: white; }
+        :root { --accent: #00d2ff; --bg: #050a15; --glass: rgba(255, 255, 255, 0.08); }
+        body { margin: 0; font-family: sans-serif; background: var(--bg); color: white; height: 100vh; overflow: hidden; display: flex; flex-direction: column; }
+        #auth { position: fixed; inset: 0; background: #000; z-index: 2000; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 15px; }
+        header { padding: 15px 20px; background: rgba(0,0,0,0.5); backdrop-filter: blur(10px); border-bottom: 1px solid var(--glass); display: flex; justify-content: space-between; align-items: center; }
+        #chat { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 12px; }
+        .msg { max-width: 85%; padding: 12px 18px; border-radius: 20px; font-size: 15px; line-height: 1.4; }
+        .user { align-self: flex-end; background: var(--accent); color: #000; font-weight: bold; border-bottom-right-radius: 4px; }
+        .ai { align-self: flex-start; background: var(--glass); border-bottom-left-radius: 4px; border: 1px solid rgba(255,255,255,0.1); }
+        .dock { padding: 15px; background: rgba(0,0,0,0.7); display: flex; gap: 10px; padding-bottom: calc(15px + env(safe-area-inset-bottom)); }
+        input { flex: 1; background: #111; border: 1px solid #333; color: white; padding: 12px 20px; border-radius: 25px; outline: none; font-size: 16px; }
+        button { background: var(--accent); border: none; padding: 12px 20px; border-radius: 25px; font-weight: bold; cursor: pointer; }
+        .fab { position: fixed; bottom: 100px; right: 20px; width: 50px; height: 50px; background: #111; border: 1px solid var(--accent); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 20px; box-shadow: 0 0 15px var(--accent); }
     </style>
 </head>
 <body>
-    <div class="glass-card">
-        <div id="reg-form">
-            <h2>Welcome to Randy-X AI</h2>
-            <input type="text" id="user-name" placeholder="Enter your name" style="width: 250px; margin-bottom: 10px;">
-            <select id="user-lang" style="padding: 10px; border-radius: 10px; margin-bottom: 10px;">
-                <option value="en">English</option>
-                <option value="ts">Xitsonga</option>
-            </select>
-            <label><input type="checkbox" id="is-premium"> I am a Premium User</label><br>
-            <button onclick="doRegister()">Launch AI</button>
-        </div>
-        <header><h1>Randy-X AI</h1></header>
-        <div id="chat-box"></div>
-        <div class="input-area">
-            <input type="text" id="user-input" placeholder="Ask me anything...">
-            <button onclick="send()">Send</button>
-        </div>
+    <div id="auth">
+        <h2 style="color:var(--accent); letter-spacing:4px;">RANDY-X PRO</h2>
+        <input type="text" id="un" placeholder="Username" style="flex:none; width:70%;">
+        <input type="password" id="pw" placeholder="Password" style="flex:none; width:70%;">
+        <button onclick="doAuth()" style="width:75%;">ACCESS SYSTEM</button>
     </div>
-
+    <header>
+        <span style="color:var(--accent); font-weight:bold;">RANDY-X CORE</span>
+        <button onclick="localStorage.clear(); location.reload();" style="background:none; border:1px solid red; color:red; padding:5px 10px;">LOGOUT</button>
+    </header>
+    <div id="chat"></div>
+    <div class="dock">
+        <input type="text" id="mi" placeholder="Message Randy-X...">
+        <button onclick="send()">SEND</button>
+    </div>
+    <div class="fab" onclick="alert('Calculator Integrated')">🖩</div>
     <script>
-        let userId = null;
-        async function doRegister() {
-            const name = document.getElementById('user-name').value;
-            const lang = document.getElementById('user-lang').value;
-            const prem = document.getElementById('is-premium').checked ? 1 : 0;
-            const res = await fetch('/register', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({name, language: lang, premium: prem})
-            });
-            const data = await res.json();
-            userId = data.user_id;
-            document.getElementById('reg-form').style.display = 'none';
+        if(localStorage.getItem('rx_u')) document.getElementById('auth').style.display='none';
+        async function doAuth() {
+            const name = document.getElementById('un').value;
+            const password = document.getElementById('pw').value;
+            const r = await fetch('/auth', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name, password, mode:'login'})});
+            const d = await r.json();
+            if(d.name) { localStorage.setItem('rx_u', d.name); location.reload(); } else alert("Access Denied");
         }
-
         async function send() {
-            const input = document.getElementById('user-input');
-            const msg = input.value;
-            if(!msg) return;
-            
-            const box = document.getElementById('chat-box');
-            box.innerHTML += `<div class="msg user">${msg}</div>`;
-            input.value = '';
-            
-            const res = await fetch('/ask', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({message: msg, user_id: userId})
-            });
-            const data = await res.json();
-            box.innerHTML += `<div class="msg ai">${data.answer}</div>`;
-            box.scrollTop = box.scrollHeight;
+            const i = document.getElementById('mi'); if(!i.value) return;
+            const b = document.getElementById('chat');
+            b.innerHTML += `<div class="msg user">${i.value}</div>`;
+            const t = i.value; i.value = '';
+            const r = await fetch('/ask', {method:'POST', body:new URLSearchParams({'message':t, 'username':localStorage.getItem('rx_u')})});
+            const d = await r.json();
+            b.innerHTML += `<div class="msg ai">${d.answer}</div>`;
+            b.scrollTop = b.scrollHeight;
         }
     </script>
 </body>
@@ -214,9 +158,4 @@ HTML_TEMPLATE = """
 """
 
 if __name__ == "__main__":
-    if not os.path.exists("templates"): os.makedirs("templates")
-    with open("templates/index.html", "w", encoding="utf-8") as f:
-        f.write(HTML_TEMPLATE)
-    
-    print("🚀 Randy-X AI is Live!")
-    app.run(debug=False, host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=5000)
